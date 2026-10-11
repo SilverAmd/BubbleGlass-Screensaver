@@ -8,9 +8,9 @@ The renderer targets smooth **60 FPS** animation and is designed to work well on
 
 ## Preview
 
-![BubbleGlass Screensaver preview](https://i.imgur.com/Nh5EyFe.png)
+![BubbleGlass Screensaver preview](assets/Preview.png)
 
-![BubbleGlass Screensaver animated preview](https://i.imgur.com/gCsmdj6.gif)
+![BubbleGlass Screensaver animated preview](assets/Preview.gif)
 
 *Transparent, animated soap bubbles move across the live Windows desktop while the desktop remains visible underneath. The optional diagnostics overlay shows real-time FPS, frame time, jitter and rendering performance.*
 
