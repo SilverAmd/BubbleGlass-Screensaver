@@ -118,6 +118,13 @@
 - profileBubbleDraw: false
   $name: Diagnostics - Profile detailed bubble drawing time
   $description: With performance logging enabled, log timing for rainbow arcs, rim, highlights and reflections. Disabled by default to avoid profiling overhead.
+
+- fixedBenchmarkSeed: false
+  $name: Diagnostics - Use identical random bubbles for FPS comparisons
+  $description: >-
+    When enabled, every new screensaver activation starts with the same
+    random bubble sizes, colors and trajectories. For fair geometry
+    benchmarks only; disable for normal use. Takes effect on the next start.
 */
 // ==/WindhawkModSettings==
 
@@ -704,6 +711,7 @@ struct Settings {
 	BOOL showPerformanceStats   = FALSE;
 	BOOL logPerformanceStats    = FALSE;
     BOOL profileBubbleDraw      = FALSE;
+    BOOL fixedBenchmarkSeed      = FALSE;
 
 	float Drift() const {
 		return driftSpeedPercent / 100.0f;
@@ -1028,6 +1036,9 @@ void LoadSettings() {
 
     g_settings.profileBubbleDraw =
         Wh_GetIntSetting(L"profileBubbleDraw", 0) ? TRUE : FALSE;
+
+    g_settings.fixedBenchmarkSeed =
+        Wh_GetIntSetting(L"fixedBenchmarkSeed", 0) ? TRUE : FALSE;
 }
 
 // ================= input hooks =================
@@ -1579,6 +1590,14 @@ Bubble SpawnBubble(bool anywhere, int W, int H) {
 }
 
 void SeedBubbles(int width, int height) {
+    // The experimental geometry comparisons in RC7 used independent random
+    // bubble populations. Since larger ellipses cost more to draw, the
+    // numbers were not directly comparable. This opt-in fixed seed
+    // recreates the same bubble sizes/hues/initial velocities on each
+    // activation while preserving all four rainbow arcs and visual quality.
+    if (g_settings.fixedBenchmarkSeed)
+        g_rng.seed(0xBABB1E5u);
+
 	g_bubbles.clear();
 	g_bubbles.reserve(static_cast<size_t>(
 	                      g_settings.bubbleCount > 0 ? g_settings.bubbleCount : 0
@@ -1896,7 +1915,7 @@ void EndPerformanceFrame() {
 		    L"physics=%.2fms clear=%.2fms draw=%.2fms "
 		    L"surface=%.2fms hud=%.2fms present=%.2fms "
 		    L"jitter=%.2fms maxFrame=%.2fms maxWork=%.2fms "
-		    L"bubbles=%zu",
+		    L"bubbles=%zu geometry=%d",
 
 		    g_perf.fps,
 		    g_perf.avgFrameMs,
@@ -1911,7 +1930,8 @@ void EndPerformanceFrame() {
 		    g_perf.jitterMs,
 		    g_perf.maxFrameMs,
 		    g_perf.maxRenderMs,
-		    g_bubbles.size()
+		    g_bubbles.size(),
+            g_settings.experimentalGeometryMode
 		);
 
         if (g_settings.profileBubbleDraw) {
@@ -1922,11 +1942,12 @@ void EndPerformanceFrame() {
                 L"BubbleGlass DRAW: setup=%.2fms rainbow=%.2fms "
                 L"rim=%.2fms highlight=%.2fms shine=%.2fms "
                 L"lower=%.2fms pop=%.2fms measured=%.2fms "
-                L"drawTotal=%.2fms arcs=%d bubbles=%zu",
+                L"drawTotal=%.2fms arcs=%d bubbles=%zu geometry=%d",
                 d.setupMs, d.rainbowMs, d.rimMs, d.highlightMs,
                 d.shineMs, d.lowerMs, d.popMs, measured,
                 g_perf.avg.bubbleDrawMs,
-                g_settings.iridescenceArcCount, g_bubbles.size());
+                g_settings.iridescenceArcCount, g_bubbles.size(),
+                g_settings.experimentalGeometryMode);
         }
 	}
 }
@@ -2747,8 +2768,10 @@ void DrawBubble(
 		StartRenderLoop();
 		RenderFrame();   // first frame immediately (no black flash)
 
-		Wh_Log(L"BubbleGlass shown (%dx%d @ %d,%d, %d bubbles)",
-		       g_vw, g_vh, g_vx, g_vy, g_settings.bubbleCount);
+		Wh_Log(L"BubbleGlass shown (%dx%d @ %d,%d, %d bubbles, geometry=%d, fixedSeed=%d)",
+		       g_vw, g_vh, g_vx, g_vy, g_settings.bubbleCount,
+               g_settings.experimentalGeometryMode,
+               g_settings.fixedBenchmarkSeed);
 	}
 
 	void HideSaver(const char* reason) {
@@ -3139,11 +3162,12 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC7 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d, geometry=%d",
+		L"BubbleGlass 1.7.5 RC8 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d, geometry=%d, fixedSeed=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount,
         g_settings.iridescenceArcCount,
-        g_settings.experimentalGeometryMode
+        g_settings.experimentalGeometryMode,
+        g_settings.fixedBenchmarkSeed
 	);
 
 	return TRUE;
