@@ -79,6 +79,13 @@
 - iridescence: true
   $name: Appearance - Thin-film iridescence
 
+- iridescenceArcCount: 4
+  $name: Performance - Rainbow arcs per bubble (2-4)
+  $description: >-
+    4 = original full-color detail (unchanged appearance).
+    3 = balanced, 2 = faster with fewer reflections. Compare FPS and appearance
+    using the same bubble count. Only applies when iridescence is enabled.
+
 - colorCycleSpeedPercent: 100
   $name: Appearance - Iridescent color cycle speed (%)
   $description: 0 freezes the interference colors. 100 = normal.
@@ -675,6 +682,7 @@ struct Settings {
 	// Appearance
 	int  bubbleOpacity          = 80;
 	BOOL iridescence            = TRUE;
+    int  iridescenceArcCount   = 4;
 	int  colorCycleSpeedPercent = 100;
 	BOOL showShadows            = FALSE;
 	int  dimPercent             = 8;
@@ -967,6 +975,12 @@ void LoadSettings() {
 
 	g_settings.iridescence =
 	    Wh_GetIntSetting(L"iridescence", 1) ? TRUE : FALSE;
+
+    // GDI+ anti-aliased DrawArc calls dominate work with 42 bubbles.
+    // Quality selection changes only the number of rainbow arcs, never
+    // the frame rate target, transparency, or bubble physics.
+    g_settings.iridescenceArcCount =
+        ClampSetting(Wh_GetIntSetting(L"iridescenceArcCount", 4), 2, 4);
 
 	g_settings.colorCycleSpeedPercent =
 	    ClampSetting(Wh_GetIntSetting(L"colorCycleSpeedPercent", 100), 0, 500);
@@ -1989,7 +2003,7 @@ void DrawBubble(
 			float alpha;
 		};
 
-		const FilmArc arcs[] = {
+		static constexpr FilmArc arcs[] = {
 			{   0.0f,   8.0f, 82.0f, 142.0f },
 			{ 112.0f, 126.0f, 70.0f, 118.0f },
 			{ 226.0f, 232.0f, 88.0f, 132.0f },
@@ -2000,7 +2014,12 @@ void DrawBubble(
         float rotation = static_cast<float>(
             std::fmod(b.phase * 57.2958 + colourTravel, 360.0));
 
-		    for (const auto& arc : arcs) {
+        // Keep the full four-arc look by default. When two arcs are
+        // requested, place them on opposing sides rather than adjacent.
+        g_bubbleGdi->irisPen.SetWidth(filmWidth);
+        for (int i = 0; i < g_settings.iridescenceArcCount; ++i) {
+            const FilmArc& arc =
+                arcs[g_settings.iridescenceArcCount == 2 ? i * 2 : i];
 			    float hue = fmodf(baseHue + arc.hueOffset, 360.0f);
 			    Color c = HslToColor(
 			        hue,
@@ -2010,7 +2029,6 @@ void DrawBubble(
 			    );
 
 			    g_bubbleGdi->irisPen.SetColor(c);
-			    g_bubbleGdi->irisPen.SetWidth(filmWidth);
 
 			    gfx.DrawArc(
 			        &g_bubbleGdi->irisPen,
@@ -2767,7 +2785,13 @@ void DrawBubble(
                 }
 
 				if (msg.message == WM_BUBBLE_SETTINGS_CHANGED) {
+                    int previousArcCount = g_settings.iridescenceArcCount;
 					LoadSettings();
+                    if (g_settings.iridescenceArcCount != previousArcCount) {
+                        Wh_Log(L"BubbleGlass rainbow arc detail: %d -> %d",
+                               previousArcCount,
+                               g_settings.iridescenceArcCount);
+                    }
 
 					if (g_saverOn) {
 						if (static_cast<int>(g_bubbles.size()) >
@@ -2955,9 +2979,10 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC4 initialized: timeout=%ds, bubbles=%d",
+		L"BubbleGlass 1.7.5 RC5 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d",
 		g_settings.idleTimeoutSec,
-		g_settings.bubbleCount
+		g_settings.bubbleCount,
+        g_settings.iridescenceArcCount
 	);
 
 	return TRUE;
