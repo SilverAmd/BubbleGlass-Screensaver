@@ -106,6 +106,10 @@
 - logPerformanceStats: false
   $name: Diagnostics - Log performance stats to Windhawk/DbgView
   $description: Writes one performance line per second while the saver is active.
+
+- profileBubbleDraw: false
+  $name: Diagnostics - Profile detailed bubble drawing time
+  $description: With performance logging enabled, log timing for rainbow arcs, rim, highlights and reflections. Disabled by default to avoid profiling overhead.
 */
 // ==/WindhawkModSettings==
 
@@ -690,6 +694,7 @@ struct Settings {
 	// Diagnostics
 	BOOL showPerformanceStats   = FALSE;
 	BOOL logPerformanceStats    = FALSE;
+    BOOL profileBubbleDraw      = FALSE;
 
 	float Drift() const {
 		return driftSpeedPercent / 100.0f;
@@ -786,7 +791,18 @@ static HANDLE g_frameTimer = nullptr;
 static bool g_timerPeriodActive = false;
 
 // ---- lightweight performance diagnostics ----
+struct BubbleDrawDetails {
+    double setupMs = 0.0;
+    double rainbowMs = 0.0;
+    double rimMs = 0.0;
+    double highlightMs = 0.0;
+    double shineMs = 0.0;
+    double lowerMs = 0.0;
+    double popMs = 0.0;
+};
+
 struct PerfBreakdown {
+    BubbleDrawDetails detail{};
 	double physicsMs    = 0.0;
 	double surfaceMs    = 0.0;
 	double clearMs      = 0.0;
@@ -997,6 +1013,9 @@ void LoadSettings() {
 
 	g_settings.logPerformanceStats =
 	    Wh_GetIntSetting(L"logPerformanceStats", 0) ? TRUE : FALSE;
+
+    g_settings.profileBubbleDraw =
+        Wh_GetIntSetting(L"profileBubbleDraw", 0) ? TRUE : FALSE;
 }
 
 // ================= input hooks =================
