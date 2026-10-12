@@ -1595,8 +1595,9 @@ void SeedBubbles(int width, int height) {
     // numbers were not directly comparable. This opt-in fixed seed
     // recreates the same bubble sizes/hues/initial velocities on each
     // activation while preserving all four rainbow arcs and visual quality.
-    if (g_settings.fixedBenchmarkSeed)
-        g_rng.seed(0xBABB1E5u);
+	if (g_settings.fixedBenchmarkSeed) {
+		g_rng.seed(0xBABB1E5u);
+	}
 
 	g_bubbles.clear();
 	g_bubbles.reserve(static_cast<size_t>(
