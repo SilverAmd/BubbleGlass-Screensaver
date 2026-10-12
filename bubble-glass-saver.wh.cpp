@@ -1970,6 +1970,9 @@ void DrawBubble(
 	if (fadeAlpha <= 0.01f)
 		return;
 
+    DrawProfileCheckpoint profile(
+        g_settings.profileBubbleDraw && g_settings.logPerformanceStats);
+
 	float popP = b.popping ? b.popProgress : 0.0f;
 	if (popP < 0.0f) popP = 0.0f;
 	if (popP > 1.0f) popP = 1.0f;
@@ -2063,6 +2066,7 @@ void DrawBubble(
 	if (filmWidth > 5.2f) filmWidth = 5.2f;
 	filmWidth *= 1.0f + popFlash * 0.55f;
 
+    profile.Mark(g_perf.current.detail.setupMs);
 	if (g_settings.iridescence) {
 		struct FilmArc {
 			float hueOffset;
@@ -2109,6 +2113,7 @@ void DrawBubble(
 			    );
             }
 		}
+        profile.Mark(g_perf.current.detail.rainbowMs);
 
 		// Neutral membrane rim. Kept subtle so the colour arcs remain dominant.
 		REAL rimWidth = 0.85f + rootR * 0.105f;
@@ -2130,6 +2135,7 @@ void DrawBubble(
 		    &g_bubbleGdi->rimPen,
 		    rect
 		);
+        profile.Mark(g_perf.current.detail.rimMs);
 
 		// Curved specular highlight in the upper-left quadrant. This reads more like
 		// reflected light on a spherical membrane than a large opaque white blob.
@@ -2157,6 +2163,7 @@ void DrawBubble(
 		    highlightStart,
 		    54.0f
 		);
+        profile.Mark(g_perf.current.detail.highlightMs);
 
 		// Tiny hot spot near the highlight. Scale it gently instead of turning it
 		// into a huge solid patch on very large bubbles.
@@ -2180,6 +2187,7 @@ void DrawBubble(
 		    dotR * 2.0f,
 		    dotR * 2.0f
 		);
+        profile.Mark(g_perf.current.detail.shineMs);
 
 		// Very faint opposite-side reflection gives the sphere a little depth.
 		g_bubbleGdi->lowerReflectionPen.SetColor(
@@ -2204,6 +2212,7 @@ void DrawBubble(
 		    38.0f,
 		    44.0f
 		);
+        profile.Mark(g_perf.current.detail.lowerMs);
 
 		// Pop: a fast expanding white ring, using the same live bubble geometry.
 		if (b.popping && popFlash > 0.02f) {
@@ -2233,6 +2242,7 @@ void DrawBubble(
 			    popRect
 			);
 		}
+    profile.Mark(g_perf.current.detail.popMs);
 	}
 
 	void RenderFrame() {
@@ -3047,7 +3057,7 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC5 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d",
+		L"BubbleGlass 1.7.5 RC6 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount,
         g_settings.iridescenceArcCount
