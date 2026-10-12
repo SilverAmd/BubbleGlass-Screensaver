@@ -610,7 +610,7 @@ Special focus was placed on:
 // ==/WindhawkModReadme==
 
 
-// v1.7.5 RC3: dedicated input hook thread, hooks installed only while visible.
+// v1.7.5 RC4: QPC-based physics time step and precision-safe animation clocks.
 //   * exact QPC-based 60 FPS frame pacing
 //   * high-resolution waitable timer
 //   * fast direct premultiplied DIB clear
@@ -764,7 +764,9 @@ static void* g_bitmapBits = nullptr;
 static HANDLE g_uiThread = nullptr;
 static DWORD  g_uiThreadId = 0;
 static HANDLE g_uiReadyEvent = nullptr;
-static ULONGLONG g_lastFrameTick = 0;
+// QPC-based simulation timing, separate from the frame pacer.
+static LONGLONG g_lastFrameQpc = 0;
+static LONGLONG g_showQpc = 0;
 static ULONGLONG g_lastBubbleSpawnTick = 0;
 
 // exact 60 FPS pacing.
@@ -864,7 +866,8 @@ Bubble SpawnBubble(bool anywhere, int W, int H);
 void  StartRenderLoop();
 void  StopRenderLoop();
 void  RenderFrame();
-void  DrawBubble(Graphics& gfx, const Bubble& b, float fadeAlpha);
+void  DrawBubble(Graphics& gfx, const Bubble& b, float fadeAlpha,
+                 double animationSeconds);
 void  ResetPerformanceStats();
 void  BeginPerformanceFrame();
 void  EndPerformanceFrame();
@@ -1557,7 +1560,8 @@ void StartRenderLoop() {
 	g_frameIntervalQpc =
 	    (g_qpcFrequency.QuadPart + 30) / 60;
 
-	g_lastFrameTick = GetTickCount64();
+	g_lastFrameQpc = 0;  // First frame uses nominal 1/60 second.
+    g_showQpc = nowQpc.QuadPart;
 
 	// ShowSaver() renders the first frame immediately.
 	g_nextFrameQpc =
@@ -1568,7 +1572,8 @@ void StartRenderLoop() {
 
 void StopRenderLoop() {
 	g_rendering = false;
-	g_lastFrameTick = 0;
+	g_lastFrameQpc = 0;
+    g_showQpc = 0;
 	g_nextFrameQpc = 0;
 
 	if (g_frameTimer)
@@ -1876,7 +1881,8 @@ void DrawPerformanceStats(Graphics& gfx, float fadeAlpha) {
 void DrawBubble(
     Graphics& gfx,
     const Bubble& b,
-    float fadeAlpha
+    float fadeAlpha,
+    double animationSeconds
 ) {
 
 	if (fadeAlpha <= 0.01f)
@@ -1912,12 +1918,13 @@ void DrawBubble(
 	const REAL x = b.x;
 	const REAL y = b.y;
 
-	DWORD now = GetTickCount();
-
+	// Seconds elapsed since the saver appeared (high-resolution, double).
+    // Avoid float precision loss from the Windows system uptime.
 	// Tiny organic deformation. Large bubbles stay calmer than small ones.
 	float sizeCalm = 1.0f / (1.0f + r * 0.0022f);
 	float wobble =
-	    sinf(now * 0.00125f * b.wobFreq + b.phase) *
+	    static_cast<float>(std::sin(
+            animationSeconds * 1.25 * b.wobFreq + b.phase)) *
 	    0.026f * sizeCalm;
 
 	wobble += popFlash * 0.018f;
@@ -1963,13 +1970,12 @@ void DrawBubble(
 
 	// Slowly travelling thin-film interference colours. The arcs are deliberately
 	// asymmetric so the bubble doesn't look like a neon ring.
-	float colourTime =
-	    static_cast<float>(now) * g_settings.ColorCycle();
-
-	float colourTravel = colourTime * 0.0055f;
-	float hueBreath =
-	    sinf(colourTime * 0.00022f + b.phase) * 24.0f;
-	float baseHue = fmodf(b.hue + hueBreath + 360.0f, 360.0f);
+    double colourTime =
+        animationSeconds * 1000.0 * g_settings.ColorCycle();
+    double colourTravel = colourTime * 0.0055;
+    float hueBreath =
+        static_cast<float>(std::sin(colourTime * 0.00022 + b.phase) * 24.0);
+    float baseHue = fmodf(b.hue + hueBreath + 360.0f, 360.0f);
 
 	REAL filmWidth = 1.15f + rootR * 0.19f;
 	if (filmWidth > 5.2f) filmWidth = 5.2f;
@@ -1990,7 +1996,9 @@ void DrawBubble(
 			{ 308.0f, 326.0f, 48.0f,  92.0f },
 		};
 
-		float rotation = b.phase * 57.2958f + colourTravel;
+        // GDI+ receives a bounded float angle even after long runs.
+        float rotation = static_cast<float>(
+            std::fmod(b.phase * 57.2958 + colourTravel, 360.0));
 
 		    for (const auto& arc : arcs) {
 			    float hue = fmodf(baseHue + arc.hueOffset, 360.0f);
@@ -2169,22 +2177,30 @@ void DrawBubble(
 
 		ULONGLONG now64 = GetTickCount64();
 
-		float dt = 1.0f / 60.0f;
-
-		if (g_lastFrameTick != 0) {
-			dt = static_cast<float>(now64 - g_lastFrameTick) / 1000.0f;
-
-			// Riesige Sprünge verhindern, z.B. nach Debugger/Pause.
-			if (dt < 0.001f)
-				dt = 0.001f;
-
-			if (dt > 0.500f)
-				dt = 0.500f;
-		}
-
-		g_lastFrameTick = now64;
-
-		DWORD now = static_cast<DWORD>(now64);
+        // Use QPC for physics and animation. GetTickCount64 can advance in
+        // coarse ~15.6 ms steps, even with an accurate QPC frame pacer.
+        LARGE_INTEGER nowQpc{};
+        QueryPerformanceCounter(&nowQpc);
+        float dt = 1.0f / 60.0f;
+        double animationSeconds = 0.0;
+        if (g_qpcFrequency.QuadPart > 0) {
+            if (g_lastFrameQpc != 0) {
+                dt = static_cast<float>(
+                    static_cast<double>(nowQpc.QuadPart - g_lastFrameQpc) /
+                    static_cast<double>(g_qpcFrequency.QuadPart));
+                // Avoid jumps after breakpoints or a stalled renderer.
+                if (dt < 0.001f)
+                    dt = 0.001f;
+                if (dt > 0.500f)
+                    dt = 0.500f;
+            }
+            if (g_showQpc != 0) {
+                animationSeconds =
+                    static_cast<double>(nowQpc.QuadPart - g_showQpc) /
+                    static_cast<double>(g_qpcFrequency.QuadPart);
+            }
+        }
+        g_lastFrameQpc = nowQpc.QuadPart;
 
 		float t =
 		    static_cast<float>(now64 - g_showTick) /
@@ -2220,14 +2236,19 @@ void DrawBubble(
 					    g_settings.turbulence / 100.0f;
 
 					float windX =
-					    sinf(now * 0.00031f + b.phase) +
-					    sinf(now * 0.00017f * b.wobFreq +
-					         b.phase * 1.73f) * 0.55f;
+                        static_cast<float>(std::sin(
+                            animationSeconds * 0.31 + b.phase)) +
+                        static_cast<float>(std::sin(
+                            animationSeconds * 0.17 * b.wobFreq +
+                            b.phase * 1.73)) * 0.55f;
 
 					float windY =
-					    cosf(now * 0.00027f + b.phase * 0.83f) +
-					    sinf(now * 0.00013f * b.wobFreq +
-					         b.phase * 2.11f) * 0.45f;
+                        static_cast<float>(std::cos(
+                            animationSeconds * 0.27 +
+                            b.phase * 0.83)) +
+                        static_cast<float>(std::sin(
+                            animationSeconds * 0.13 * b.wobFreq +
+                            b.phase * 2.11)) * 0.45f;
 
 					float windAcceleration =
 					    turbulenceAmount * 0.0065f * frameScale;
@@ -2253,8 +2274,9 @@ void DrawBubble(
 				b.y += b.vy * drift * frameScale;
 
 				// Tiny organic side drift. This is not a second velocity integration.
-				b.x += sinf(now * 0.001f * b.wobFreq + b.phase) *
-				       b.wobAmp * 0.08f * frameScale;
+                b.x += static_cast<float>(std::sin(
+                    animationSeconds * b.wobFreq + b.phase)) *
+                    b.wobAmp * 0.08f * frameScale;
 
 				b.life -= dt;
 
@@ -2461,7 +2483,7 @@ void DrawBubble(
 			PerfMark(g_perf.current.clearMs);
 
 			for (const auto& b : g_bubbles)
-				DrawBubble(gfx, b, g_fade);
+				DrawBubble(gfx, b, g_fade, animationSeconds);
 
 			PerfMark(g_perf.current.bubbleDrawMs);
 
@@ -2933,7 +2955,7 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC3 initialized: timeout=%ds, bubbles=%d",
+		L"BubbleGlass 1.7.5 RC4 initialized: timeout=%ds, bubbles=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount
 	);
