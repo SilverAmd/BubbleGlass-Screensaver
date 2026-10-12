@@ -79,6 +79,14 @@
 - iridescence: true
   $name: Appearance - Thin-film iridescence
 
+- experimentalGeometryMode: 0
+  $name: Performance - Experimental Bezier geometry (0-2)
+  $description: >-
+    0 = original GDI+ arcs and rim, unchanged appearance.
+    1 = experimental Bezier rainbow arcs.
+    2 = experimental Bezier rainbow arcs and outer rim.
+    This may improve or reduce FPS and may slightly change curves.
+
 - iridescenceArcCount: 4
   $name: Performance - Rainbow arcs per bubble (2-4)
   $description: >-
@@ -686,6 +694,7 @@ struct Settings {
 	// Appearance
 	int  bubbleOpacity          = 80;
 	BOOL iridescence            = TRUE;
+    int  experimentalGeometryMode = 0;
     int  iridescenceArcCount   = 4;
 	int  colorCycleSpeedPercent = 100;
 	BOOL showShadows            = FALSE;
@@ -997,6 +1006,9 @@ void LoadSettings() {
     // the frame rate target, transparency, or bubble physics.
     g_settings.iridescenceArcCount =
         ClampSetting(Wh_GetIntSetting(L"iridescenceArcCount", 4), 2, 4);
+
+    g_settings.experimentalGeometryMode =
+        ClampSetting(Wh_GetIntSetting(L"experimentalGeometryMode", 0), 0, 2);
 
 	g_settings.colorCycleSpeedPercent =
 	    ClampSetting(Wh_GetIntSetting(L"colorCycleSpeedPercent", 100), 0, 500);
@@ -1960,6 +1972,64 @@ void DrawPerformanceStats(Graphics& gfx, float fadeAlpha) {
 	               RectF(x, y + 114.0f, w - 28.0f, 38.0f), &format, &textBrush);
 }
 
+// Opt-in cubic Bezier alternative to DrawArc / DrawEllipse.
+// Approximate an elliptical arc in <=45-degree sections, retaining
+// high-quality GDI+ antialiasing and original colours/widths.
+// All control points are on the stack. No cached bitmaps or resources.
+void DrawBezierArc(Graphics& gfx, const Pen& pen,
+                   REAL x, REAL y, REAL w, REAL h,
+                   REAL startDeg, REAL sweepDeg, bool fullRim = false) {
+    if (w <= 0.0f || h <= 0.0f || sweepDeg == 0.0f)
+        return;
+
+    constexpr double kPi = 3.14159265358979323846;
+    const int segmentCount = fullRim ? 8 :
+        static_cast<int>(std::ceil(std::fabs(
+            static_cast<double>(sweepDeg)) / 45.0));
+    if (segmentCount < 1 || segmentCount > 8)
+        return;
+
+    const double start = static_cast<double>(startDeg) * kPi / 180.0;
+    const double step = static_cast<double>(sweepDeg) * kPi /
+                        (180.0 * segmentCount);
+    const double factor = (4.0 / 3.0) * std::tan(step * 0.25);
+    const double radiusX = w * 0.5;
+    const double radiusY = h * 0.5;
+    const double centerX = x + radiusX;
+    const double centerY = y + radiusY;
+    const double cosStep = std::cos(step);
+    const double sinStep = std::sin(step);
+    double ca = std::cos(start);
+    double sa = std::sin(start);
+
+    PointF points[25] {};
+    points[0] = PointF(static_cast<REAL>(centerX + radiusX * ca),
+                       static_cast<REAL>(centerY + radiusY * sa));
+
+    for (int i = 0; i < segmentCount; ++i) {
+        const double cb = ca * cosStep - sa * sinStep;
+        const double sb = sa * cosStep + ca * sinStep;
+        const int index = 1 + 3 * i;
+        points[index] = PointF(
+            static_cast<REAL>(centerX + radiusX * (ca - factor * sa)),
+            static_cast<REAL>(centerY + radiusY * (sa + factor * ca)));
+        points[index + 1] = PointF(
+            static_cast<REAL>(centerX + radiusX * (cb + factor * sb)),
+            static_cast<REAL>(centerY + radiusY * (sb - factor * cb)));
+        points[index + 2] = PointF(
+            static_cast<REAL>(centerX + radiusX * cb),
+            static_cast<REAL>(centerY + radiusY * sb));
+        ca = cb;
+        sa = sb;
+    }
+
+    // Make the closing endpoint match exactly (no tiny rounding gap).
+    if (fullRim)
+        points[3 * segmentCount] = points[0];
+
+    gfx.DrawBeziers(&pen, points, 1 + 3 * segmentCount);
+}
+
 void DrawBubble(
     Graphics& gfx,
     const Bubble& b,
@@ -2102,15 +2172,16 @@ void DrawBubble(
 
 			    g_bubbleGdi->irisPen.SetColor(c);
 
-			    gfx.DrawArc(
-			        &g_bubbleGdi->irisPen,
-			        rect.X,
-			        rect.Y,
-			        rect.Width,
-			        rect.Height,
-			        rotation + arc.angleOffset,
-			        arc.sweep
-			    );
+                if (g_settings.experimentalGeometryMode >= 1) {
+                    DrawBezierArc(gfx, g_bubbleGdi->irisPen,
+                                  rect.X, rect.Y, rect.Width, rect.Height,
+                                  rotation + arc.angleOffset, arc.sweep);
+                } else {
+                    gfx.DrawArc(
+                        &g_bubbleGdi->irisPen,
+                        rect.X, rect.Y, rect.Width, rect.Height,
+                        rotation + arc.angleOffset, arc.sweep);
+                }
             }
 		}
         profile.Mark(g_perf.current.detail.rainbowMs);
@@ -2131,10 +2202,13 @@ void DrawBubble(
 
 		g_bubbleGdi->rimPen.SetWidth(rimWidth);
 
-		gfx.DrawEllipse(
-		    &g_bubbleGdi->rimPen,
-		    rect
-		);
+        if (g_settings.experimentalGeometryMode >= 2) {
+            DrawBezierArc(gfx, g_bubbleGdi->rimPen,
+                          rect.X, rect.Y, rect.Width, rect.Height,
+                          0.0f, 360.0f, true);
+        } else {
+            gfx.DrawEllipse(&g_bubbleGdi->rimPen, rect);
+        }
         profile.Mark(g_perf.current.detail.rimMs);
 
 		// Curved specular highlight in the upper-left quadrant. This reads more like
@@ -2864,7 +2938,15 @@ void DrawBubble(
 
 				if (msg.message == WM_BUBBLE_SETTINGS_CHANGED) {
                     int previousArcCount = g_settings.iridescenceArcCount;
+                    int previousGeometryMode =
+                        g_settings.experimentalGeometryMode;
 					LoadSettings();
+                    if (g_settings.experimentalGeometryMode !=
+                            previousGeometryMode) {
+                        Wh_Log(L"BubbleGlass Bezier geometry: %d -> %d",
+                               previousGeometryMode,
+                               g_settings.experimentalGeometryMode);
+                    }
                     if (g_settings.iridescenceArcCount != previousArcCount) {
                         Wh_Log(L"BubbleGlass rainbow arc detail: %d -> %d",
                                previousArcCount,
@@ -3057,10 +3139,11 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC6 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d",
+		L"BubbleGlass 1.7.5 RC7 initialized: timeout=%ds, bubbles=%d, rainbowArcs=%d, geometry=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount,
-        g_settings.iridescenceArcCount
+        g_settings.iridescenceArcCount,
+        g_settings.experimentalGeometryMode
 	);
 
 	return TRUE;
