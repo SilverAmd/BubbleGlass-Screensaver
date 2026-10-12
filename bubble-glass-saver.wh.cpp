@@ -622,6 +622,7 @@ Special focus was placed on:
 #include <windows.h>
 #include <shellapi.h>
 #include <wtsapi32.h>
+#include <cstring>
 #include <gdiplus.h>
 #include <vector>
 #include <random>
@@ -1139,7 +1140,12 @@ LRESULT CALLBACK ControlWndProc(HWND hWnd, UINT message,
             // the screen even when the last-input timestamp is still old.
             g_resumeGraceUntil = GetTickCount64() + 3000;
         }
-        return 0;
+        if (previouslyUnavailable != IsDesktopUnavailable() ||
+            message == WM_WTSSESSION_CHANGE) {
+            Wh_Log(L"BubbleGlass visibility: locked=%d disconnected=%d displayOff=%d",
+                   g_sessionLocked, g_sessionDisconnected, g_displayOff);
+        }
+        return message == WM_POWERBROADCAST ? TRUE : 0;
     }
 
     return DefWindowProcW(hWnd, message, wParam, lParam);
