@@ -6,7 +6,7 @@
 // @author          SilverAmd
 // @github          https://github.com/SilverAmd
 // @include         windhawk.exe
-// @compilerOptions -lgdiplus -lgdi32 -lwinmm -lshell32
+// @compilerOptions -lgdiplus -lgdi32 -lwinmm -lshell32 -lwtsapi32 -luser32
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
@@ -610,7 +610,7 @@ Special focus was placed on:
 // ==/WindhawkModReadme==
 
 
-// v1.7.5 RC1: dedicated tool-process test; 60 FPS renderer unchanged.
+// v1.7.5 RC2: dedicated tool process and visibility-aware idle rendering.
 //   * exact QPC-based 60 FPS frame pacing
 //   * high-resolution waitable timer
 //   * fast direct premultiplied DIB clear
@@ -621,6 +621,7 @@ Special focus was placed on:
 
 #include <windows.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 #include <gdiplus.h>
 #include <vector>
 #include <random>
@@ -710,6 +711,24 @@ struct Bubble {
 static HHOOK g_mouseHook = nullptr;
 static HHOOK g_kbdHook   = nullptr;
 static HWND  g_saverWnd  = nullptr;
+// The notification window and its state are owned by BubbleUiThread.
+static HWND g_controlWnd = nullptr;
+static bool g_controlClassRegistered = false;
+static bool g_sessionNotificationsRegistered = false;
+static HPOWERNOTIFY g_displayPowerNotification = nullptr;
+static bool g_sessionLocked = false;
+static bool g_sessionDisconnected = false;
+static bool g_displayOff = false;
+static ULONGLONG g_resumeGraceUntil = 0;
+
+constexpr GUID kConsoleDisplayState = {
+    0x6fe69556, 0x704a, 0x47a0,
+    {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}
+};
+
+bool IsDesktopUnavailable() {
+    return g_sessionLocked || g_sessionDisconnected || g_displayOff;
+}
 static bool  g_saverOn   = false;
 static bool  g_rendering = false;
 static bool  g_classRegistered = false;
@@ -1018,8 +1037,10 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 // Runs on a 250 ms timer. Near-zero cost while dismissed.
 VOID CALLBACK IdleTimer(HWND, UINT, UINT_PTR, DWORD) {
 	DWORD idleMs = 0;
-	if (!g_saverOn && IsIdle(&idleMs) &&
-	        idleMs >= (DWORD)g_settings.idleTimeoutSec * 1000) {
+	if (!g_saverOn && !IsDesktopUnavailable() &&
+        GetTickCount64() >= g_resumeGraceUntil &&
+        IsIdle(&idleMs) &&
+        idleMs >= (DWORD)g_settings.idleTimeoutSec * 1000) {
 		ShowSaver();
 	}
 }
@@ -1061,11 +1082,129 @@ void RegisterSaverClass() {
 		g_classRegistered = true;
 }
 
+
 void UnregisterSaverClass() {
 	if (g_classRegistered) {
 		UnregisterClassW(L"BubbleGlassSaver", GetModuleHandleW(nullptr));
 		g_classRegistered = false;
 	}
+}
+
+// Session and power notifications arrive on the UI thread that owns the
+// saver window, so state changes do not need cross-thread synchronization.
+LRESULT CALLBACK ControlWndProc(HWND hWnd, UINT message,
+                                WPARAM wParam, LPARAM lParam) {
+    bool handled = false;
+    bool previouslyUnavailable = IsDesktopUnavailable();
+
+    if (message == WM_WTSSESSION_CHANGE) {
+        switch (wParam) {
+            case WTS_SESSION_LOCK:
+                g_sessionLocked = true;
+                handled = true;
+                break;
+            case WTS_SESSION_UNLOCK:
+                g_sessionLocked = false;
+                handled = true;
+                break;
+            case WTS_CONSOLE_DISCONNECT:
+            case WTS_REMOTE_DISCONNECT:
+                g_sessionDisconnected = true;
+                handled = true;
+                break;
+            case WTS_CONSOLE_CONNECT:
+            case WTS_REMOTE_CONNECT:
+                g_sessionDisconnected = false;
+                handled = true;
+                break;
+        }
+    } else if (message == WM_POWERBROADCAST &&
+               wParam == PBT_POWERSETTINGCHANGE) {
+        const auto* power =
+            reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+        if (power && power->DataLength >= sizeof(DWORD) &&
+            IsEqualGUID(power->PowerSetting, kConsoleDisplayState)) {
+            DWORD state = 1;
+            memcpy(&state, power->Data, sizeof(state));
+            g_displayOff = state == 0;  // 0 = off, 1 = on, 2 = dimmed
+            handled = true;
+        }
+    }
+
+    if (handled) {
+        if (IsDesktopUnavailable()) {
+            HideSaver("session-locked/disconnected-or-display-off");
+        } else if (previouslyUnavailable) {
+            // Avoid reopening immediately after the user unlocks or wakes
+            // the screen even when the last-input timestamp is still old.
+            g_resumeGraceUntil = GetTickCount64() + 3000;
+        }
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+void RegisterControlWindow() {
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ControlWndProc;
+    wc.hInstance = instance;
+    wc.lpszClassName = L"BubbleGlassControl";
+    if (!RegisterClassExW(&wc)) {
+        Wh_Log(L"BubbleGlass: RegisterClassExW(control) failed (%lu)",
+               GetLastError());
+        return;
+    }
+    g_controlClassRegistered = true;
+
+    // Hidden zero-sized top-level window, following Windhawk fluid-wallpaper.
+    // Unlike the saver window, it exists for the entire tool-mod lifetime.
+    g_controlWnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"BubbleGlassControl", L"", WS_POPUP, 0, 0, 0, 0,
+        nullptr, nullptr, instance, nullptr);
+    if (!g_controlWnd) {
+        Wh_Log(L"BubbleGlass: CreateWindowExW(control) failed (%lu)",
+               GetLastError());
+        return;
+    }
+
+    g_sessionNotificationsRegistered =
+        WTSRegisterSessionNotification(g_controlWnd,
+                                       NOTIFY_FOR_THIS_SESSION) != FALSE;
+    if (!g_sessionNotificationsRegistered) {
+        Wh_Log(L"BubbleGlass: WTS session notification failed (%lu)",
+               GetLastError());
+    }
+
+    g_displayPowerNotification =
+        RegisterPowerSettingNotification(g_controlWnd, &kConsoleDisplayState,
+                                          DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!g_displayPowerNotification) {
+        Wh_Log(L"BubbleGlass: console display notification failed (%lu)",
+               GetLastError());
+    }
+}
+
+void UnregisterControlWindow() {
+    if (g_sessionNotificationsRegistered) {
+        WTSUnRegisterSessionNotification(g_controlWnd);
+        g_sessionNotificationsRegistered = false;
+    }
+    if (g_displayPowerNotification) {
+        UnregisterPowerSettingNotification(g_displayPowerNotification);
+        g_displayPowerNotification = nullptr;
+    }
+    if (g_controlWnd) {
+        DestroyWindow(g_controlWnd);
+        g_controlWnd = nullptr;
+    }
+    if (g_controlClassRegistered) {
+        UnregisterClassW(L"BubbleGlassControl", GetModuleHandleW(nullptr));
+        g_controlClassRegistered = false;
+    }
 }
 
 // ================= back buffer =================
@@ -2245,9 +2384,10 @@ void DrawBubble(
 	// Transparent topmost layered window, click-through by design.
 	// DWM keeps compositing the live desktop underneath.
 	void ShowSaver() {
+        if (g_saverOn || IsDesktopUnavailable() ||
+            GetTickCount64() < g_resumeGraceUntil)
+            return;
         g_ignoreDismissUntil = 0;
-		if (g_saverOn)
-			return;
 		GetCursorPos(&g_atShow);
 
 		if (g_settings.multiMonitor) {
@@ -2319,6 +2459,7 @@ void DrawBubble(
 		PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
 		RegisterSaverClass();
+        RegisterControlWindow();
 
 		// High-resolution frame timer.
 		// Auto-reset timer: one wake-up per armed frame deadline.
@@ -2558,7 +2699,8 @@ void DrawBubble(
 			g_timerPeriodActive = false;
 		}
 
-		UnregisterSaverClass();
+		UnregisterControlWindow();
+        UnregisterSaverClass();
 
 		g_uiThreadId = 0;
 
@@ -2642,7 +2784,7 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC1 initialized: timeout=%ds, bubbles=%d",
+		L"BubbleGlass 1.7.5 RC2 initialized: timeout=%ds, bubbles=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount
 	);
