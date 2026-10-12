@@ -610,7 +610,7 @@ Special focus was placed on:
 // ==/WindhawkModReadme==
 
 
-// v1.7.5 RC2: dedicated tool process and visibility-aware idle rendering.
+// v1.7.5 RC3: dedicated input hook thread, hooks installed only while visible.
 //   * exact QPC-based 60 FPS frame pacing
 //   * high-resolution waitable timer
 //   * fast direct premultiplied DIB clear
@@ -642,6 +642,9 @@ using namespace Gdiplus;
 constexpr DWORD FADE_IN_MS = 400;
 constexpr float COLLISION_RESTITUTION = 0.985f;
 constexpr UINT WM_BUBBLE_SETTINGS_CHANGED = WM_APP + 101;
+constexpr UINT WM_BUBBLE_DISMISS = WM_APP + 102;
+constexpr UINT WM_BUBBLE_INPUT_ARM = WM_APP + 103;
+constexpr UINT WM_BUBBLE_INPUT_DISARM = WM_APP + 104;
 
 struct Settings {
 	// General
@@ -709,8 +712,22 @@ struct Bubble {
 };
 
 // ---- globals ----
+// These hook variables and callbacks are used only on the input thread.
 static HHOOK g_mouseHook = nullptr;
-static HHOOK g_kbdHook   = nullptr;
+static HHOOK g_kbdHook = nullptr;
+static HANDLE g_inputThread = nullptr;
+static DWORD g_inputThreadId = 0;
+static HANDLE g_inputReadyEvent = nullptr;
+static HWND g_inputWindow = nullptr;
+static bool g_hookArmed = false;
+static bool g_hookDismissPosted = false;
+static POINT g_hookAtShow{};
+static int g_hookThreshold = 6;
+static UINT_PTR g_hookSerial = 0;
+static ULONGLONG g_hookGraceUntil = 0;
+
+// Only the UI thread reads/writes the current display generation.
+static UINT_PTR g_showSerial = 0;
 static HWND  g_saverWnd  = nullptr;
 // The notification window and its state are owned by BubbleUiThread.
 static HWND g_controlWnd = nullptr;
@@ -733,7 +750,6 @@ bool IsDesktopUnavailable() {
 static bool  g_saverOn   = false;
 static bool  g_rendering = false;
 static bool  g_classRegistered = false;
-static POINT g_atShow{0, 0};
 static std::vector<Bubble> g_bubbles;
 static std::mt19937 g_rng;
 static ULONG_PTR g_gdiplusToken = 0;
@@ -750,7 +766,6 @@ static DWORD  g_uiThreadId = 0;
 static HANDLE g_uiReadyEvent = nullptr;
 static ULONGLONG g_lastFrameTick = 0;
 static ULONGLONG g_lastBubbleSpawnTick = 0;
-static ULONGLONG g_ignoreDismissUntil = 0;
 
 // exact 60 FPS pacing.
 static LARGE_INTEGER g_qpcFrequency{};
@@ -968,73 +983,158 @@ void LoadSettings() {
 }
 
 // ================= input hooks =================
-// Any keystroke dismisses immediately. Never swallow input.
+// This dedicated thread pumps low-level keyboard/mouse hooks without ever
+// rendering frames. Hooks exist only while the saver is visible. The callbacks
+// never block Windows input or call the UI thread synchronously.
+void QueueDismiss(int reason) {
+    if (!g_hookArmed || g_hookDismissPosted || !g_uiThreadId)
+        return;
+    if (PostThreadMessageW(g_uiThreadId, WM_BUBBLE_DISMISS,
+                           static_cast<WPARAM>(g_hookSerial),
+                           static_cast<LPARAM>(reason))) {
+        g_hookDismissPosted = true;
+    }
+}
+
 LRESULT CALLBACK KbdProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && g_saverOn &&
+    if (nCode == HC_ACTION && g_hookArmed &&
         (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
-
-        const auto* kb =
-            reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
-
+        const auto* kb = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
         if (kb && kb->vkCode == VK_SNAPSHOT) {
-            // Allow time to open Snipping Tool and select the screenshot area.
-            g_ignoreDismissUntil = GetTickCount64() + 5000;
-
-            // Do NOT swallow Print Screen.
-            // Windows/Snipping Tool must still receive it.
-            return CallNextHookEx(
-                g_kbdHook,
-                nCode,
-                wParam,
-                lParam
-            );
-        }
-
-        if (GetTickCount64() >= g_ignoreDismissUntil) {
-            HideSaver("keystroke");
+            // Preserve the ability to take a Snipping Tool screenshot.
+            g_hookGraceUntil = GetTickCount64() + 5000;
+        } else if (GetTickCount64() >= g_hookGraceUntil) {
+            QueueDismiss(1);  // Key press.
         }
     }
-
-    return CallNextHookEx(
-        g_kbdHook,
-        nCode,
-        wParam,
-        lParam
-    );
+    return CallNextHookEx(g_kbdHook, nCode, wParam, lParam);
 }
 
-// Mouse travel beyond threshold dismisses (jitter-filtered).
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-	if (nCode == HC_ACTION) {
-        if (g_saverOn &&
-    GetTickCount64() < g_ignoreDismissUntil) {
-
-    return CallNextHookEx(
-        g_mouseHook,
-        nCode,
-        wParam,
-        lParam
-    );
+    if (nCode == HC_ACTION && g_hookArmed &&
+        GetTickCount64() >= g_hookGraceUntil) {
+        const auto* ms = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (ms) {
+            if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+                wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN ||
+                wParam == WM_MOUSEWHEEL || wParam == WM_MOUSEHWHEEL) {
+                QueueDismiss(2);  // Click or wheel.
+            } else if (wParam == WM_MOUSEMOVE) {
+                LONGLONG dx = static_cast<LONGLONG>(ms->pt.x) -
+                              g_hookAtShow.x;
+                LONGLONG dy = static_cast<LONGLONG>(ms->pt.y) -
+                              g_hookAtShow.y;
+                LONGLONG threshold = g_hookThreshold;
+                if (dx * dx + dy * dy >= threshold * threshold)
+                    QueueDismiss(3);  // Mouse movement.
+            }
+        }
+    }
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
-		auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-		if (g_saverOn) {
-			if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-			        wParam == WM_MBUTTONDOWN || wParam == WM_MOUSEWHEEL ||
-			        wParam == WM_XBUTTONDOWN) {
-				HideSaver("click/wheel");
-			} else {
-				long dx = ms->pt.x - g_atShow.x;
-				long dy = ms->pt.y - g_atShow.y;
-				long th  = g_settings.dismissDeltaPx;
-				if (dx * dx + dy * dy >= th * th)
-					HideSaver("mouse-move");
-			}
-		}
-	}
-	return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+
+void DisarmInputHooks() {
+    g_hookArmed = false;
+    if (g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    }
+    if (g_kbdHook) {
+        UnhookWindowsHookEx(g_kbdHook);
+        g_kbdHook = nullptr;
+    }
+    g_hookDismissPosted = false;
+}
+
+LRESULT CALLBACK InputWndProc(HWND hWnd, UINT message,
+                              WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+        case WM_BUBBLE_INPUT_ARM: {
+            DisarmInputHooks();
+            g_hookThreshold = static_cast<int>(wParam);
+            g_hookSerial = static_cast<UINT_PTR>(lParam);
+            g_hookGraceUntil = 0;
+            if (!GetCursorPos(&g_hookAtShow)) {
+                Wh_Log(L"BubbleGlass: GetCursorPos(input) failed");
+                return FALSE;
+            }
+
+            g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc,
+                                            nullptr, 0);
+            if (!g_mouseHook) {
+                Wh_Log(L"BubbleGlass: mouse hook failed (%lu)",
+                       GetLastError());
+                DisarmInputHooks();
+                return FALSE;
+            }
+            g_kbdHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbdProc,
+                                          nullptr, 0);
+            if (!g_kbdHook) {
+                Wh_Log(L"BubbleGlass: keyboard hook failed (%lu)",
+                       GetLastError());
+                DisarmInputHooks();
+                return FALSE;
+            }
+            g_hookArmed = true;
+            Wh_Log(L"BubbleGlass input hooks armed");
+            return TRUE;
+        }
+        case WM_BUBBLE_INPUT_DISARM:
+            DisarmInputHooks();
+            return TRUE;
+        case WM_CLOSE:
+            DisarmInputHooks();
+            DestroyWindow(hWnd);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+DWORD WINAPI BubbleInputThread(LPVOID) {
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = instance;
+    wc.lpfnWndProc = InputWndProc;
+    wc.lpszClassName = L"BubbleGlassInputControl";
+    bool registered = RegisterClassExW(&wc) != 0;
+    if (!registered) {
+        Wh_Log(L"BubbleGlass: input window class registration failed (%lu)",
+               GetLastError());
+    }
+
+    HWND wnd = registered ? CreateWindowExW(
+        0, L"BubbleGlassInputControl", L"", 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, nullptr) : nullptr;
+    if (registered && !wnd) {
+        Wh_Log(L"BubbleGlass: input window creation failed (%lu)",
+               GetLastError());
+    }
+    g_inputWindow = wnd;
+    if (g_inputReadyEvent)
+        SetEvent(g_inputReadyEvent);
+
+    if (wnd) {
+        Wh_Log(L"BubbleGlass input thread ready");
+        MSG message{};
+        while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        DisarmInputHooks();
+        if (IsWindow(wnd))
+            DestroyWindow(wnd);
+    }
+
+    g_inputWindow = nullptr;
+    if (registered)
+        UnregisterClassW(L"BubbleGlassInputControl", instance);
+    return wnd ? 0 : 1;
 }
 
 // ================= idle watchdog =================
+
 // Runs on a 250 ms timer. Near-zero cost while dismissed.
 VOID CALLBACK IdleTimer(HWND, UINT, UINT_PTR, DWORD) {
 	DWORD idleMs = 0;
@@ -2391,10 +2491,8 @@ void DrawBubble(
 	// DWM keeps compositing the live desktop underneath.
 	void ShowSaver() {
         if (g_saverOn || IsDesktopUnavailable() ||
-            GetTickCount64() < g_resumeGraceUntil)
+            GetTickCount64() < g_resumeGraceUntil || !g_inputWindow)
             return;
-        g_ignoreDismissUntil = 0;
-		GetCursorPos(&g_atShow);
 
 		if (g_settings.multiMonitor) {
 			g_vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -2412,6 +2510,20 @@ void DrawBubble(
 
 		RegisterSaverClass();
 
+        // Arm hooks on the input thread before revealing the overlay.
+        // Never show an overlay that cannot be dismissed by user input.
+        DWORD_PTR armResult = 0;
+        UINT_PTR serial = ++g_showSerial;
+        if (!SendMessageTimeoutW(g_inputWindow, WM_BUBBLE_INPUT_ARM,
+                                 g_settings.dismissDeltaPx,
+                                 static_cast<LPARAM>(serial),
+                                 SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000,
+                                 &armResult) || armResult != TRUE) {
+            Wh_Log(L"BubbleGlass: input hooks unavailable; skipping saver");
+            g_resumeGraceUntil = GetTickCount64() + 5000;
+            return;
+        }
+
 		g_saverWnd = CreateWindowExW(
 		                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
 		                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -2419,6 +2531,9 @@ void DrawBubble(
 		                 WS_POPUP, g_vx, g_vy, g_vw, g_vh,
 		                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
 		if (!g_saverWnd) {
+            SendMessageTimeoutW(g_inputWindow, WM_BUBBLE_INPUT_DISARM,
+                                0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                2000, nullptr);
 			Wh_Log(L"BubbleGlass: CreateWindowExW failed (%lu)",
 			       GetLastError());
 			return;
@@ -2445,6 +2560,11 @@ void DrawBubble(
 		if (!g_saverOn)
 			return;
 		g_saverOn = false;
+        if (g_inputWindow) {
+            SendMessageTimeoutW(g_inputWindow, WM_BUBBLE_INPUT_DISARM,
+                                0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                2000, nullptr);
+        }
 		StopRenderLoop();
 		if (g_saverWnd) {
 			DestroyWindow(g_saverWnd);
@@ -2488,28 +2608,24 @@ void DrawBubble(
 				g_timerPeriodActive = true;
 		}
 
-		// Low-level hooks gehören auf denselben Thread, der Nachrichten pumpt.
-		g_mouseHook = SetWindowsHookExW(
-		                  WH_MOUSE_LL,
-		                  MouseProc,
-		                  nullptr,
-		                  0
-		              );
-
-		if (!g_mouseHook) {
-			Wh_Log(L"BubbleGlass: mouse hook failed (%lu)", GetLastError());
-		}
-
-		g_kbdHook = SetWindowsHookExW(
-		                WH_KEYBOARD_LL,
-		                KbdProc,
-		                nullptr,
-		                0
-		            );
-
-		if (!g_kbdHook) {
-			Wh_Log(L"BubbleGlass: keyboard hook failed (%lu)", GetLastError());
-		}
+		// Independent, message-only hook thread: never waits on GDI+ rendering.
+        g_inputReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (g_inputReadyEvent) {
+            g_inputThread = CreateThread(nullptr, 0, BubbleInputThread,
+                                          nullptr, 0, &g_inputThreadId);
+            if (g_inputThread) {
+                if (WaitForSingleObject(g_inputReadyEvent, 5000) !=
+                    WAIT_OBJECT_0 || !g_inputWindow) {
+                    Wh_Log(L"BubbleGlass: input thread did not start correctly");
+                }
+            } else {
+                Wh_Log(L"BubbleGlass: cannot create input thread (%lu)",
+                       GetLastError());
+            }
+        } else {
+            Wh_Log(L"BubbleGlass: cannot create input ready event (%lu)",
+                   GetLastError());
+        }
 
 		// Idle watchdog läuft nun ebenfalls auf diesem Thread.
 		g_idleTimer = SetTimer(
@@ -2613,6 +2729,18 @@ void DrawBubble(
 					break;
 				}
 
+                if (msg.message == WM_BUBBLE_DISMISS) {
+                    // Ignore late events from a previous saver activation.
+                    if (g_saverOn &&
+                        static_cast<UINT_PTR>(msg.wParam) == g_showSerial) {
+                        const char* reason = msg.lParam == 1 ? "keystroke" :
+                                             msg.lParam == 2 ? "click/wheel" :
+                                                               "mouse-move";
+                        HideSaver(reason);
+                    }
+                    continue;
+                }
+
 				if (msg.message == WM_BUBBLE_SETTINGS_CHANGED) {
 					LoadSettings();
 
@@ -2684,15 +2812,27 @@ void DrawBubble(
 			g_idleTimer = 0;
 		}
 
-		if (g_mouseHook) {
-			UnhookWindowsHookEx(g_mouseHook);
-			g_mouseHook = nullptr;
-		}
-
-		if (g_kbdHook) {
-			UnhookWindowsHookEx(g_kbdHook);
-			g_kbdHook = nullptr;
-		}
+        // Hooks and their control window belong to the input thread.
+        if (g_inputWindow)
+            PostMessageW(g_inputWindow, WM_CLOSE, 0, 0);
+        else if (g_inputThreadId)
+            PostThreadMessageW(g_inputThreadId, WM_QUIT, 0, 0);
+        if (g_inputThread) {
+            // On timeout terminate the dedicated tool process, never leave
+            // executing hook callbacks in a module about to be unloaded.
+            if (WaitForSingleObject(g_inputThread, 5000) != WAIT_OBJECT_0) {
+                Wh_Log(L"BubbleGlass: input thread did not exit in time");
+                ExitProcess(1);
+            }
+            CloseHandle(g_inputThread);
+            g_inputThread = nullptr;
+            g_inputThreadId = 0;
+            g_inputWindow = nullptr;
+        }
+        if (g_inputReadyEvent) {
+            CloseHandle(g_inputReadyEvent);
+            g_inputReadyEvent = nullptr;
+        }
 
 		if (g_frameTimer) {
 			CancelWaitableTimer(g_frameTimer);
@@ -2790,7 +2930,7 @@ BOOL WhTool_ModInit() {
 	);
 
 	Wh_Log(
-		L"BubbleGlass 1.7.5 RC2 initialized: timeout=%ds, bubbles=%d",
+		L"BubbleGlass 1.7.5 RC3 initialized: timeout=%ds, bubbles=%d",
 		g_settings.idleTimeoutSec,
 		g_settings.bubbleCount
 	);
