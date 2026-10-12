@@ -1034,6 +1034,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 void DisarmInputHooks() {
+    const bool wasArmed = g_hookArmed;
     g_hookArmed = false;
     if (g_mouseHook) {
         UnhookWindowsHookEx(g_mouseHook);
@@ -1044,6 +1045,8 @@ void DisarmInputHooks() {
         g_kbdHook = nullptr;
     }
     g_hookDismissPosted = false;
+    if (wasArmed)
+        Wh_Log(L"BubbleGlass input hooks disarmed");
 }
 
 LRESULT CALLBACK InputWndProc(HWND hWnd, UINT message,
