@@ -1646,6 +1646,26 @@ double PerfDeltaMs(
 	    static_cast<double>(g_perf.frequency.QuadPart);
 }
 
+// Optional per-bubble QPC checkpoints; no QPC calls when disabled.
+struct DrawProfileCheckpoint {
+    bool enabled;
+    LARGE_INTEGER previous{};
+
+    explicit DrawProfileCheckpoint(bool active) : enabled(active) {
+        if (enabled)
+            QueryPerformanceCounter(&previous);
+    }
+
+    void Mark(double& accumulatedMs) {
+        if (!enabled)
+            return;
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        accumulatedMs += PerfDeltaMs(previous, now);
+        previous = now;
+    }
+};
+
 void ResetPerformanceStats() {
 	g_perf = PerformanceStats{};
 
@@ -1743,6 +1763,13 @@ void EndPerformanceFrame() {
 		    g_perf.breakdown[i];
 
 		sum.physicsMs    += p.physicsMs;
+        sum.detail.setupMs += p.detail.setupMs;
+        sum.detail.rainbowMs += p.detail.rainbowMs;
+        sum.detail.rimMs += p.detail.rimMs;
+        sum.detail.highlightMs += p.detail.highlightMs;
+        sum.detail.shineMs += p.detail.shineMs;
+        sum.detail.lowerMs += p.detail.lowerMs;
+        sum.detail.popMs += p.detail.popMs;
 		sum.surfaceMs    += p.surfaceMs;
 		sum.clearMs      += p.clearMs;
 		sum.bubbleDrawMs += p.bubbleDrawMs;
@@ -1758,6 +1785,13 @@ void EndPerformanceFrame() {
 	g_perf.avgRenderMs = sumRender / n;
 
 	g_perf.avg.physicsMs    = sum.physicsMs / n;
+    g_perf.avg.detail.setupMs = sum.detail.setupMs / n;
+    g_perf.avg.detail.rainbowMs = sum.detail.rainbowMs / n;
+    g_perf.avg.detail.rimMs = sum.detail.rimMs / n;
+    g_perf.avg.detail.highlightMs = sum.detail.highlightMs / n;
+    g_perf.avg.detail.shineMs = sum.detail.shineMs / n;
+    g_perf.avg.detail.lowerMs = sum.detail.lowerMs / n;
+    g_perf.avg.detail.popMs = sum.detail.popMs / n;
 	g_perf.avg.surfaceMs    = sum.surfaceMs / n;
 	g_perf.avg.clearMs      = sum.clearMs / n;
 	g_perf.avg.bubbleDrawMs = sum.bubbleDrawMs / n;
@@ -1867,6 +1901,21 @@ void EndPerformanceFrame() {
 		    g_perf.maxRenderMs,
 		    g_bubbles.size()
 		);
+
+        if (g_settings.profileBubbleDraw) {
+            const BubbleDrawDetails& d = g_perf.avg.detail;
+            const double measured = d.setupMs + d.rainbowMs + d.rimMs +
+                d.highlightMs + d.shineMs + d.lowerMs + d.popMs;
+            Wh_Log(
+                L"BubbleGlass DRAW: setup=%.2fms rainbow=%.2fms "
+                L"rim=%.2fms highlight=%.2fms shine=%.2fms "
+                L"lower=%.2fms pop=%.2fms measured=%.2fms "
+                L"drawTotal=%.2fms arcs=%d bubbles=%zu",
+                d.setupMs, d.rainbowMs, d.rimMs, d.highlightMs,
+                d.shineMs, d.lowerMs, d.popMs, measured,
+                g_perf.avg.bubbleDrawMs,
+                g_settings.iridescenceArcCount, g_bubbles.size());
+        }
 	}
 }
 
